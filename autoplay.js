@@ -1,12 +1,18 @@
 /**
  * Blooket auto-play bookmarklet (readable source).
  *
- * Run this while you're IN a Blooket game (after PIN + nickname + blook).
- * It digs the current question and its correct answers out of the game's
- * React state, then clicks the right answer tile with human-like timing.
+ * BEST RESULTS: run this in the game LOBBY (right after picking your blook,
+ * before the host starts) so it can capture the question set as the game
+ * downloads it. Running mid-game works too if the question data is readable
+ * from the page's React state.
  *
- * The panel shows live diagnostics: whether it can see a question, how many
- * answer tiles it sees, and what it's doing.
+ * Two independent ways it learns answers:
+ *   1. Network capture: hooks fetch/XHR/WebSocket and harvests any question
+ *      objects ({question, answers, correctAnswers}) into an answer bank.
+ *   2. React state scan: walks the page's React fiber tree for the current
+ *      question object.
+ * Then it reads the question on screen, picks the right tile, waits a
+ * randomized delay, and clicks (mouse + touch events, works on mobile).
  *
  * The one-line bookmark version lives in bookmarklet.txt.
  */
@@ -23,7 +29,8 @@
     maxDelay: 3500,
     lastQuestion: "",
     answered: 0,
-    source: null, // cached fiber that holds the question state
+    source: null,
+    bank: new Map(), // normalized question -> [normalized correct answers]
   });
 
   const norm = (s) =>
@@ -41,8 +48,123 @@
     Array.isArray(o.correctAnswers) &&
     o.correctAnswers.length > 0;
 
-  // Generic deep search for a question object inside any state/props blob.
-  function deepFindQ(root, maxDepth = 7) {
+  // ---------- 1. network capture ----------
+  function harvest(obj, depth = 0) {
+    if (!obj || typeof obj !== "object" || depth > 8) return;
+    if (isQ(obj)) {
+      bot.bank.set(norm(obj.question), obj.correctAnswers.map(norm));
+      return;
+    }
+    if (Array.isArray(obj)) {
+      for (const v of obj) harvest(v, depth + 1);
+    } else {
+      for (const k in obj) {
+        try {
+          if (obj[k] && typeof obj[k] === "object") harvest(obj[k], depth + 1);
+        } catch {}
+      }
+    }
+  }
+
+  function harvestText(text) {
+    if (!text || text.indexOf("correctAnswers") === -1) return;
+    try {
+      harvest(JSON.parse(text));
+      return;
+    } catch {}
+    // Not a clean JSON document (e.g. framed socket payload): pull out each
+    // balanced {...} around every "correctAnswers" occurrence.
+    let idx = 0;
+    while ((idx = text.indexOf('"correctAnswers"', idx)) !== -1) {
+      let start = idx;
+      let depth = 0;
+      while (start > 0) {
+        const c = text[start];
+        if (c === "}") depth++;
+        if (c === "{") {
+          if (depth === 0) break;
+          depth--;
+        }
+        start--;
+      }
+      let end = start;
+      depth = 0;
+      let inStr = false;
+      for (; end < text.length; end++) {
+        const c = text[end];
+        if (inStr) {
+          if (c === "\\") end++;
+          else if (c === '"') inStr = false;
+        } else if (c === '"') inStr = true;
+        else if (c === "{") depth++;
+        else if (c === "}") {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      try {
+        harvest(JSON.parse(text.slice(start, end + 1)));
+      } catch {}
+      idx += 16;
+    }
+  }
+
+  // fetch
+  const origFetch = window.fetch;
+  window.fetch = function (...a) {
+    const p = origFetch.apply(this, a);
+    p.then((res) => {
+      try {
+        res.clone().text().then(harvestText).catch(() => {});
+      } catch {}
+    }).catch(() => {});
+    return p;
+  };
+
+  // XHR
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (...a) {
+    this.addEventListener("load", function () {
+      try {
+        if (typeof this.responseText === "string") harvestText(this.responseText);
+      } catch {}
+    });
+    return origOpen.apply(this, a);
+  };
+
+  // WebSocket (Blooket games run over Firebase realtime sockets; long
+  // messages arrive split across frames, with a leading digits-only frame)
+  const OrigWS = window.WebSocket;
+  window.WebSocket = function (...a) {
+    const ws = new OrigWS(...a);
+    let buffer = "";
+    let expecting = 0;
+    ws.addEventListener("message", (ev) => {
+      if (typeof ev.data !== "string") return;
+      const d = ev.data;
+      if (/^\d+$/.test(d) && d.length < 7) {
+        expecting = parseInt(d, 10);
+        buffer = "";
+        return;
+      }
+      if (expecting > 0) {
+        buffer += d;
+        expecting--;
+        if (expecting === 0) {
+          harvestText(buffer);
+          buffer = "";
+        }
+      } else {
+        harvestText(d);
+      }
+    });
+    return ws;
+  };
+  window.WebSocket.prototype = OrigWS.prototype;
+  Object.setPrototypeOf(window.WebSocket, OrigWS);
+
+  // ---------- 2. React fiber scan ----------
+  function deepFindQ(root, maxDepth = 6) {
     if (!root || typeof root !== "object") return null;
     const seen = new Set();
     const queue = [[root, 0]];
@@ -52,7 +174,7 @@
       if (!obj || typeof obj !== "object" || seen.has(obj)) continue;
       seen.add(obj);
       if (typeof Node !== "undefined" && obj instanceof Node) continue;
-      if (obj.$$typeof) continue; // react element, skip
+      if (obj.$$typeof) continue;
       if (isQ(obj)) return obj;
       if (d >= maxDepth) continue;
       if (Array.isArray(obj)) {
@@ -69,7 +191,6 @@
     return null;
   }
 
-  // Pull every candidate state container off a fiber.
   function fiberSources(fiber) {
     const out = [];
     if (fiber.stateNode && fiber.stateNode.state) out.push(fiber.stateNode.state);
@@ -80,6 +201,7 @@
     let guard = 0;
     while (hook && typeof hook === "object" && "next" in hook && guard++ < 150) {
       if (hook.memoizedState && typeof hook.memoizedState === "object") out.push(hook.memoizedState);
+      if (hook.baseState && typeof hook.baseState === "object") out.push(hook.baseState);
       hook = hook.next;
     }
     return out;
@@ -87,42 +209,33 @@
 
   function findFiberRoots() {
     const roots = [];
-    const scope = [document.getElementById("app") || document.body];
-    for (const base of scope) {
-      for (const node of [base, ...base.querySelectorAll("*")]) {
-        for (const key of Object.keys(node)) {
-          if (key.startsWith("__reactContainer$") || key.startsWith("__reactFiber$")) {
-            roots.push(node[key]);
-            if (roots.length >= 3) return roots;
-          }
+    const base = document.getElementById("app") || document.body;
+    for (const node of [base, ...base.querySelectorAll("*")]) {
+      for (const key of Object.keys(node)) {
+        if (key.startsWith("__reactContainer$") || key.startsWith("__reactFiber$")) {
+          roots.push(node[key]);
         }
-        if (roots.length) break; // one hooked element is enough per base
       }
+      if (roots.length) break;
     }
     return roots;
   }
 
   let fibersScanned = 0;
-  function scanForQuestion() {
-    // Fast path: re-read the fiber we found the question on last time.
+  function scanFibers() {
     if (bot.source) {
-      for (const src of fiberSources(bot.source)) {
-        const q = deepFindQ(src);
-        if (q) return q;
-      }
-      // also try its alternate (React double-buffers fibers between renders)
-      if (bot.source.alternate) {
-        for (const src of fiberSources(bot.source.alternate)) {
+      for (const f of [bot.source, bot.source.alternate]) {
+        if (!f) continue;
+        for (const src of fiberSources(f)) {
           const q = deepFindQ(src);
           if (q) {
-            bot.source = bot.source.alternate;
+            bot.source = f;
             return q;
           }
         }
       }
-      bot.source = null; // stale, rescan
+      bot.source = null;
     }
-
     fibersScanned = 0;
     for (const root of findFiberRoots()) {
       const stack = [root];
@@ -141,12 +254,23 @@
         }
         if (fiber.child) stack.push(fiber.child);
         if (fiber.sibling) stack.push(fiber.sibling);
+        if (fiber.alternate && !seen.has(fiber.alternate)) stack.push(fiber.alternate);
       }
     }
     return null;
   }
 
-  // ---- DOM interaction ----
+  // ---------- DOM ----------
+  function getQuestionText() {
+    const els = [...document.querySelectorAll('[class*="question" i]')].filter(
+      (el) => el.offsetParent !== null && (el.textContent || "").trim().length > 0
+    );
+    if (!els.length) return "";
+    // innermost question element has the cleanest text
+    els.sort((a, b) => a.textContent.length - b.textContent.length);
+    return els[0].textContent;
+  }
+
   function getAnswerElements() {
     let els = [...document.querySelectorAll('[class*="answer" i], [class*="option" i], [class*="choice" i]')].filter(
       (el) =>
@@ -154,8 +278,6 @@
         (el.textContent || "").trim().length > 0 &&
         !el.querySelector('[class*="answer" i], [class*="option" i], [class*="choice" i]')
     );
-    // climb each leaf to the outermost matching container so clicks land on
-    // the element React listens on
     els = els.map((el) => {
       let cur = el;
       while (
@@ -178,7 +300,6 @@
     for (const t of ["pointerover", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
       el.dispatchEvent(t.startsWith("pointer") ? new PointerEvent(t, opts) : new MouseEvent(t, opts));
     }
-    // touch events for mobile Safari
     try {
       const touch = new Touch({ identifier: 1, target: el, clientX: x, clientY: y });
       el.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [touch], targetTouches: [touch], changedTouches: [touch] }));
@@ -188,31 +309,51 @@
 
   const rand = (a, b) => a + Math.random() * (b - a);
 
-  // ---- main loop ----
+  // ---------- main loop ----------
   let pending = false;
   setInterval(() => {
     if (!bot.enabled || pending) return;
 
-    const q = scanForQuestion();
     const answerEls = getAnswerElements();
 
-    if (!q) {
-      setStatus(`No question in game state yet (tiles: ${answerEls.length}, fibers: ${fibersScanned}). Answered: ${bot.answered}`);
+    // Current question: prefer React state, fall back to on-screen text + bank
+    let question = "";
+    let corrects = [];
+    const qObj = scanFibers();
+    if (qObj) {
+      question = norm(qObj.question);
+      corrects = qObj.correctAnswers.map(norm);
+    } else {
+      question = norm(getQuestionText());
+      if (question && bot.bank.has(question)) corrects = bot.bank.get(question);
+    }
+
+    if (!question) {
+      setStatus(`No question on screen. Bank: ${bot.bank.size} · tiles: ${answerEls.length} · answered: ${bot.answered}`);
       return;
     }
     if (answerEls.length < 2) {
-      setStatus(`See question "${q.question.slice(0, 30)}…" but only ${answerEls.length} answer tile(s). Answered: ${bot.answered}`);
+      setStatus(`Question visible but only ${answerEls.length} tile(s). Bank: ${bot.bank.size}`);
       return;
     }
-
-    const qKey = norm(q.question);
-    if (qKey === bot.lastQuestion) {
-      setStatus(`Waiting for next question… Answered: ${bot.answered}`);
+    if (question === bot.lastQuestion) {
+      setStatus(`Waiting for next question… Bank: ${bot.bank.size} · answered: ${bot.answered}`);
       return;
     }
-    bot.lastQuestion = qKey;
+    if (!corrects.length && !bot.bank.size && !qObj) {
+      // Nothing to go on at all — don't burn the question with a guess yet;
+      // wait a bit in case the bank fills, then guess anyway.
+      if (!bot._graceStart || bot._graceQ !== question) {
+        bot._graceStart = Date.now();
+        bot._graceQ = question;
+      }
+      if (Date.now() - bot._graceStart < 4000) {
+        setStatus(`Answer unknown (bank empty) — waiting… Run me in the lobby next game!`);
+        return;
+      }
+    }
+    bot.lastQuestion = question;
 
-    const corrects = q.correctAnswers.map(norm);
     const texts = answerEls.map((el) => norm(el.textContent));
     const correctIdxs = texts.map((_, i) => i).filter((i) => corrects.includes(texts[i]));
     const wrongIdxs = texts.map((_, i) => i).filter((i) => !corrects.includes(texts[i]));
@@ -225,7 +366,7 @@
     const delay = rand(bot.minDelay, bot.maxDelay);
     setStatus(`Q${bot.answered + 1}: answering in ${(delay / 1000).toFixed(1)}s ${correctIdxs.length ? (beCorrect ? "✓" : "✗ (deliberate)") : "? (guess)"}`);
     setTimeout(() => {
-      const els = getAnswerElements(); // re-grab, DOM may have re-rendered
+      const els = getAnswerElements();
       const target = els.find((el) => norm(el.textContent) === texts[pick]) || els[pick] || answerEls[pick];
       if (target) clickAnswer(target);
       bot.answered++;
@@ -233,7 +374,7 @@
     }, delay);
   }, 400);
 
-  // ---- control panel ----
+  // ---------- control panel ----------
   const panel = document.createElement("div");
   bot.panel = panel;
   panel.style.cssText =
@@ -257,5 +398,5 @@
   $("[data-min]").onchange = (e) => (bot.minDelay = Math.max(0, +e.target.value * 1000));
   $("[data-max]").onchange = (e) => (bot.maxDelay = Math.max(bot.minDelay, +e.target.value * 1000));
 
-  setStatus("Running. Scanning game state…");
+  setStatus("Running. Best run from the game lobby so I can capture the question set.");
 })();
