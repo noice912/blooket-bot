@@ -1,0 +1,13 @@
+{
+  "name": "blooket-bot",
+  "version": "1.0.0",
+  "description": "A Playwright-based bot that joins a Blooket game and plays automatically",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
